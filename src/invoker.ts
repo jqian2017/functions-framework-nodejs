@@ -25,6 +25,10 @@ import * as domain from 'domain';
 import * as express from 'express';
 import * as http from 'http';
 import * as onFinished from 'on-finished';
+import {Logger, LoggerLevel } from '@salesforce/core';
+import {InvocationEvent, Context as SalesforceContext } from '@salesforce/salesforce-sdk';
+import applySfFxMiddleware from './sfmiddleware';
+
 
 // HTTP header field that is added to Worker response to signalize problems with
 // executing the client function.
@@ -108,7 +112,12 @@ export interface EventFunction {
   // tslint:disable-next-line:no-any
   (data: {}, context: Context): any;
 }
+export interface SalesforceFunction {
+  (event: InvocationEvent, context: SalesforceContext, logger: Logger): any;
+}
+
 export type HandlerFunction =
+  | SalesforceFunction
   | HttpFunction
   | EventFunction
   | EventFunctionWithCallback;
@@ -149,7 +158,7 @@ function isHttpFunction(
 export function getUserFunction(
   codeLocation: string,
   functionTarget: string
-): HandlerFunction | null {
+): SalesforceFunction | null {
   try {
     const functionModulePath = getFunctionModulePath(codeLocation);
     if (functionModulePath === null) {
@@ -189,7 +198,7 @@ export function getUserFunction(
       return null;
     }
 
-    return userFunction as HandlerFunction;
+    return userFunction as SalesforceFunction;
   } catch (ex) {
     let additionalHint: string;
     // TODO: this should be done based on ex.code rather than string matching.
@@ -346,9 +355,51 @@ const urlEncodedOptions = {
  * @param execute Runs user's function.
  * @return An Express handler function.
  */
-function makeHttpHandler(execute: HttpFunction): express.RequestHandler {
+// function makeHttpHandler(execute: HttpFunction): express.RequestHandler {
+//   return (req: express.Request, res: express.Response) => {
+//     const d = domain.create();
+//     // Catch unhandled errors originating from this request.
+//     d.on('error', err => {
+//       if (res.locals.functionExecutionFinished) {
+//         console.error(`Exception from a finished function: ${err}`);
+//       } else {
+//         res.locals.functionExecutionFinished = true;
+//         logAndSendError(err, res);
+//       }
+//     });
+//     d.run(() => {
+//       process.nextTick(() => {
+//         execute(req, res);
+//       });
+//     });
+//   };
+// }
+
+/**
+ * Wraps the provided function into an Express handler function with additional
+ * instrumentation logic.
+ * @param execute Runs user's function.
+ * @return An Express handler function.
+ */
+function makeSalesforceHandler(execute: SalesforceFunction): express.RequestHandler {
   return (req: express.Request, res: express.Response) => {
     const d = domain.create();
+    const input = {
+      payload: Object.assign({}, req.body),
+      headers: Object.assign({}, req.headers)
+    };
+
+    const level =  LoggerLevel.INFO;
+    const logger = new Logger('Evergreen Logger');
+    logger.addStream({stream: process.stderr});
+    logger.setLevel(level);
+    logger.addField('request_id', 'requestIDJing');
+
+    const state = {};
+    let middlewareResult = [req.body, logger];
+
+    middlewareResult = applySfFxMiddleware(input, state, middlewareResult);
+
     // Catch unhandled errors originating from this request.
     d.on('error', err => {
       if (res.locals.functionExecutionFinished) {
@@ -359,8 +410,10 @@ function makeHttpHandler(execute: HttpFunction): express.RequestHandler {
       }
     });
     d.run(() => {
-      process.nextTick(() => {
-        execute(req, res);
+      process.nextTick(async () => {
+        res.send(await execute(middlewareResult[0] as InvocationEvent,
+            middlewareResult[1] as SalesforceContext,
+            middlewareResult[2] as Logger));
       });
     });
   };
@@ -476,7 +529,7 @@ function wrapEventFunction(
  */
 function registerFunctionRoutes(
   app: express.Application,
-  userFunction: HandlerFunction,
+  userFunction: SalesforceFunction,
   functionSignatureType: SignatureType
 ) {
   if (isHttpFunction(userFunction!, functionSignatureType)) {
@@ -492,16 +545,18 @@ function registerFunctionRoutes(
     });
 
     app.all('/*', (req, res, next) => {
-      const handler = makeHttpHandler(userFunction);
-      handler(req, res, next);
-    });
-  } else {
-    app.post('/*', (req, res, next) => {
-      const wrappedUserFunction = wrapEventFunction(userFunction);
-      const handler = makeHttpHandler(wrappedUserFunction);
+      //const handler = makeHttpHandler(userFunction);
+      const handler = makeSalesforceHandler(userFunction);
       handler(req, res, next);
     });
   }
+  // else {
+  //   app.post('/*', (req, res, next) => {
+  //     const wrappedUserFunction = wrapEventFunction(userFunction);
+  //     const handler = makeHttpHandler(wrappedUserFunction);
+  //     handler(req, res, next);
+  //   });
+  // }
 }
 
 // Use an exit code which is unused by Node.js:
@@ -554,7 +609,7 @@ export class ErrorHandler {
  * @return HTTP server.
  */
 export function getServer(
-  userFunction: HandlerFunction,
+  userFunction: SalesforceFunction,
   functionSignatureType: SignatureType
 ): http.Server {
   // App to use for function executions.
@@ -575,6 +630,14 @@ export function getServer(
   // MUST be last in the list of body parsers as subsequent parsers will be
   // skipped when one is matched.
   app.use(bodyParser.raw(rawBodySavingOptions));
+
+  app.use('/*', (req, res, next) => {
+    console.log("jing own middleware");
+    //req.body
+    //req.headers
+    next();
+  });
+
 
   registerFunctionRoutes(app, userFunction, functionSignatureType);
 

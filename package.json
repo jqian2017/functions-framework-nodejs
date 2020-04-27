@@ -12,7 +12,9 @@
     "body-parser": "^1.18.3",
     "express": "^4.16.4",
     "minimist": "^1.2.0",
-    "on-finished": "^2.3.0"
+    "on-finished": "^2.3.0",
+    "@salesforce/core": "^2.2.0",
+    "@salesforce/salesforce-sdk": "^1.1.0"
   },
   "scripts": {
     "test": "mocha build/test",
